@@ -753,3 +753,30 @@ def test_the_scans_own_mime_guess_is_not_history(folders, session, temp_dir):
 
     assert _live(session, older.content_id) == str(temp_dir / "real" / "f.png")
     assert _live(session, newer.content_id) is None
+
+
+def test_a_contested_target_taken_by_a_racing_writer_rolls_back_whole(folders, session, temp_dir, monkeypatch):
+    """Records do not move onto a winner whose rewrite then fails, and its losers are
+    not retired: the target is applied as a unit or not at all."""
+    real = temp_dir / "real"
+    _populate(real, ("f.png", "g.png"))
+    folders.use(output=real, models=None)
+    first, second = _alias(real, temp_dir / "a1"), _alias(real, temp_dir / "a2")
+    stub = _row(session, first / "f.png", age_days=0)
+    with_history = _row(session, second / "f.png", age_days=1)  # wins: it carries a job
+    stub_record = _record_of(session, stub.content_id)
+    _record_of(session, with_history.content_id).job_id = "job-new"
+    moved = _row(session, first / "g.png")
+    racer = _row(session, real / "f.png", age_days=5)
+    session.flush()
+    # The racer's insert lands between the occupant read and the writes.
+    monkeypatch.setattr(scanner_rehome, "_live_occupants", lambda _session, _paths: {})
+
+    result = mark_contents_missing_outside_prefixes(session, [str(real)])
+
+    assert (result.marked, result.rehomed, result.conflict_retired, result.merged_records) == (0, 1, 0, 0)
+    assert _live(session, stub.content_id) == str(first / "f.png")
+    assert _live(session, with_history.content_id) == str(second / "f.png")
+    assert _records_on(session, stub.content_id) == {stub_record.id}
+    assert _live(session, racer.content_id) == str(real / "f.png")
+    assert _live(session, moved.content_id) == str(real / "g.png")

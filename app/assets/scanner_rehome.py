@@ -511,26 +511,51 @@ def _live_occupants(session: Session, paths: Sequence[str]) -> dict[str, PruneRo
     return occupants
 
 
-def _rewrite_paths(session: Session, rewrites: Sequence[dict[str, str]]) -> int:
-    """Apply path rewrites, skipping any whose path another writer took after the
-    occupants were read; such a row keeps its old path until the next startup."""
-    written = 0
-    for chunk in _batches(rewrites):
+class _Target(NamedTuple):
+    """One contested or re-homed path, applied as a unit: its records move, its
+    losers retire and its winner is rewritten together, or none of them happen."""
+
+    rewrite: dict[str, str] | None  # the winner's new path, None when it already holds it
+    losers: list[str]
+    moved_records: list[dict[str, str]]
+
+
+def _apply_targets(session: Session, targets: Sequence[_Target]) -> list[_Target]:
+    """Apply targets a chunk at a time, falling back to one at a time for a chunk that
+    hits a live-path conflict. A target whose path another writer took after the
+    occupants were read is rolled back whole: its losers stay live and its winner
+    keeps its old path until the next startup. Returns the targets applied."""
+
+    def apply(chunk: Sequence[_Target]) -> None:
+        with session.begin_nested():
+            moved = [record for target in chunk for record in target.moved_records]
+            for records in _batches(moved):
+                session.execute(sa.update(Asset), list(records))
+            # After the moves, so the records that moved are not tagged missing, and
+            # before the rewrites: a loser may hold the path its winner is about to take.
+            for target in chunk:
+                for content_id in target.losers:
+                    mark_content_missing(session, content_id)
+            rewrites = [target.rewrite for target in chunk if target.rewrite is not None]
+            for paths in _batches(rewrites):
+                session.execute(sa.update(AssetContent), list(paths))
+            session.flush()
+
+    applied: list[_Target] = []
+    for chunk in _batches(targets):
         try:
-            with session.begin_nested():
-                session.execute(sa.update(AssetContent), list(chunk))
-            written += len(chunk)
+            apply(chunk)
+            applied.extend(chunk)
             continue
         except IntegrityError:
             pass
-        for rewrite in chunk:
+        for target in chunk:
             try:
-                with session.begin_nested():
-                    session.execute(sa.update(AssetContent), [rewrite])
-                written += 1
+                apply([target])
+                applied.append(target)
             except IntegrityError:
                 logging.info("Asset prune: a re-home target was taken concurrently; retrying next startup")
-    return written
+    return applied
 
 
 def apply_prune_plan(session: Session, plan: PrunePlan) -> PruneResult:
@@ -574,41 +599,34 @@ def apply_prune_plan(session: Session, plan: PrunePlan) -> PruneResult:
     def has_history(row: PruneRow) -> bool:
         return any(carries for _, carries in history.get(row.content_id, ()))
 
-    rewrites: list[dict[str, str]] = []
-    losers: list[str] = []
-    moved_records: list[dict[str, str]] = []
+    targets: list[_Target] = []
     for new_path, contenders in contested.items():
         occupant = occupants.get(new_path)
         # A row carrying history keeps the path over an untouched stub, then the oldest,
         # so a healed file is listed once.
         winner = min(contenders, key=lambda row: (not has_history(row), row.created_at, row.content_id))
-        for row in contenders:
-            if row is winner:
-                continue
-            losers.append(row.content_id)
-            # Nothing is merged field by field: a content may hold several records (a
-            # cached output adds one per delivery), and each keeps its own fields. An
-            # untouched stub stays on the retired row, so the file is not listed twice.
-            moved_records.extend(
-                {"id": record_id, "content_id": winner.content_id}
-                for record_id, carries in history.get(row.content_id, ())
-                if carries
-            )
-        if winner is not occupant:
-            rewrites.append({"id": winner.content_id, "path": new_path})
+        losers = [row.content_id for row in contenders if row is not winner]
+        # Nothing is merged field by field: a content may hold several records (a
+        # cached output adds one per delivery), and each keeps its own fields. An
+        # untouched stub stays on the retired row, so the file is not listed twice.
+        moved_records = [
+            {"id": record_id, "content_id": winner.content_id}
+            for content_id in losers
+            for record_id, carries in history.get(content_id, ())
+            if carries
+        ]
+        rewrite = None if winner is occupant else {"id": winner.content_id, "path": new_path}
+        targets.append(_Target(rewrite, losers, moved_records))
 
-    # Before retiring, so the records that move are not tagged missing with the rest.
-    for chunk in _batches(moved_records):
-        session.execute(sa.update(Asset), list(chunk))
-    # Retire first: a loser may hold the path its winner is about to take.
-    for content_id in [*retire, *losers]:
+    for content_id in retire:
         mark_content_missing(session, content_id)
-    rehomed = _rewrite_paths(session, rewrites)
+    applied = _apply_targets(session, targets)
+    losers_retired = sum(len(target.losers) for target in applied)
     session.flush()
     return PruneResult(
-        marked=len(retire) + len(losers),
-        rehomed=rehomed,
+        marked=len(retire) + losers_retired,
+        rehomed=sum(target.rewrite is not None for target in applied),
         still_present=still_present,
-        conflict_retired=len(losers),
-        merged_records=len(moved_records),
+        conflict_retired=losers_retired,
+        merged_records=sum(len(target.moved_records) for target in applied),
     )
