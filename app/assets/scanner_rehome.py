@@ -43,8 +43,9 @@ import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.assets import mode
 from app.assets.database.models import Asset, AssetContent, AssetTag
-from app.assets.database.queries.records import mark_content_missing
+from app.assets.database.queries.records import is_live_path_conflict, mark_content_missing
 from app.assets.services.gil import yield_gil
 from app.assets.services.path_utils import compute_loader_path, get_path_derived_tags_from_path
 
@@ -74,6 +75,7 @@ class PruneRow(NamedTuple):
     created_at: datetime
     size_bytes: int | None = None
     mtime_ns: int | None = None
+    hash: str | None = None
 
 
 class RespelledRow(NamedTuple):
@@ -517,10 +519,17 @@ def _record_history(
                 or record.mime_type not in scanned_mimes
                 or record.updated_at - record.created_at > _EDITED_AFTER
                 or record.name != os.path.basename(path)
-                or bool(tags.get(record.id, set()) - derived_tags)
+                # "missing" is the tag a retired row's records get automatically.
+                or bool(tags.get(record.id, set()) - derived_tags - {"missing"})
             )
             history[record.content_id].append((record.id, has_history))
     return history
+
+
+def _recovery_would_match(parked: PruneRow, mover: PruneRow, hashing: bool) -> bool:
+    if parked.size_bytes != mover.size_bytes:
+        return False
+    return parked.mtime_ns == mover.mtime_ns or (hashing and parked.hash is not None)
 
 
 def _missing_rows(session: Session, paths: Sequence[str]) -> dict[str, list[PruneRow]]:
@@ -540,14 +549,17 @@ def _missing_rows(session: Session, paths: Sequence[str]) -> dict[str, list[Prun
             AssetContent.created_at,
             AssetContent.size_bytes,
             AssetContent.mtime_ns,
+            AssetContent.hash,
         )
         .where(AssetContent.is_missing.is_(True))
         .where(sa.exists().where(Asset.content_id == AssetContent.id))
         .execution_options(yield_per=_BATCH)
     )
-    for content_id, path, created_at, size_bytes, mtime_ns in session.execute(stmt):
+    for content_id, path, created_at, size_bytes, mtime_ns, hash_value in session.execute(stmt):
         if path in wanted:
-            rows.setdefault(path, []).append(PruneRow(content_id, path, created_at, size_bytes, mtime_ns))
+            rows.setdefault(path, []).append(
+                PruneRow(content_id, path, created_at, size_bytes, mtime_ns, hash_value)
+            )
     return rows
 
 
@@ -571,6 +583,7 @@ class _Target(NamedTuple):
     losers: list[str]
     moved_records: list[dict[str, str]]  # record re-points: history in, and any stubs out
     merged: int  # records with history moved onto the kept row
+    revived: tuple[str, ...] = ()  # moved from a missing row: their "missing" tag goes
 
 
 def _apply_targets(session: Session, targets: Sequence[_Target]) -> list[_Target]:
@@ -584,6 +597,11 @@ def _apply_targets(session: Session, targets: Sequence[_Target]) -> list[_Target
             moved = [record for target in chunk for record in target.moved_records]
             for records in _batches(moved):
                 session.execute(sa.update(Asset), list(records))
+            revived = [record_id for target in chunk for record_id in target.revived]
+            for records in _batches(revived):
+                session.execute(
+                    sa.delete(AssetTag).where(AssetTag.asset_id.in_(records), AssetTag.tag_name == "missing")
+                )
             # After the moves, so the records that moved are not tagged missing, and
             # before the rewrites: a loser may hold the path its winner is about to take.
             for target in chunk:
@@ -600,13 +618,16 @@ def _apply_targets(session: Session, targets: Sequence[_Target]) -> list[_Target
             apply(chunk)
             applied.extend(chunk)
             continue
-        except IntegrityError:
-            pass
+        except IntegrityError as error:
+            if not is_live_path_conflict(error):
+                raise
         for target in chunk:
             try:
                 apply([target])
                 applied.append(target)
-            except IntegrityError:
+            except IntegrityError as error:
+                if not is_live_path_conflict(error):
+                    raise
                 logging.info("Asset prune: a re-home target was taken concurrently; retrying next startup")
     return applied
 
@@ -661,17 +682,20 @@ def apply_prune_plan(session: Session, plan: PrunePlan) -> PruneResult:
     def has_history(row: PruneRow) -> bool:
         return any(carries for _, carries in history.get(row.content_id, ()))
 
+    hashing = mode.hashing_enabled()
     targets: list[_Target] = []
     for new_path, contenders in contested.items():
         occupant = occupants.get(new_path)
-        stats = {(row.size_bytes, row.mtime_ns) for row in contenders}
+        # Parked rows the scan's recovery would take for this same file: same size, and
+        # the same mtime, or (with hashing on) a stored hash it can compare.
         recoverable = [
-            row for row in parked.get(new_path, ()) if has_history(row) and (row.size_bytes, row.mtime_ns) in stats
+            row
+            for row in parked.get(new_path, ())
+            if has_history(row) and any(_recovery_would_match(row, mover, hashing) for mover in contenders)
         ]
         if recoverable and not any(has_history(row) for row in contenders):
             # Leave the path to the scan's recovery: retire the stubs at their own
-            # spellings. A mover with history of its own is re-homed as usual instead,
-            # rather than leaving its edits on a row that recovery might not restore.
+            # spellings, so the history row comes back with its own id.
             targets.append(_Target(None, [row.content_id for row in contenders], [], 0))
             continue
         # A live row already at the path keeps it, so every retired row stays at its own
@@ -700,7 +724,16 @@ def apply_prune_plan(session: Session, plan: PrunePlan) -> PruneResult:
                 for record_id, _ in history.get(host.content_id, ())
             )
         rewrite = None if host is occupant else {"id": host.content_id, "path": new_path}
-        targets.append(_Target(rewrite, [loser.content_id for loser in losers], moved_records, merged))
+        # A mover with history of its own keeps the path; the recoverable rows' history
+        # joins it, so none is left behind on a missing row at a live path.
+        revived = tuple(
+            record_id for row in recoverable for record_id, carries in history.get(row.content_id, ()) if carries
+        )
+        moved_records.extend({"id": record_id, "content_id": host.content_id} for record_id in revived)
+        merged += len(revived)
+        targets.append(
+            _Target(rewrite, [loser.content_id for loser in losers], moved_records, merged, revived)
+        )
 
     for content_id in retire:
         mark_content_missing(session, content_id)

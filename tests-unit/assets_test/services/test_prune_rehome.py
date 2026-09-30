@@ -17,6 +17,7 @@ from unittest.mock import patch
 
 import pytest
 import sqlalchemy as sa
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session as SASession, sessionmaker
 
 import folder_paths
@@ -956,3 +957,97 @@ def test_a_folder_split_by_the_old_bug_gets_its_history_back_when_spelled_as_bef
     assert _boot() == 0
 
     assert _records(session) == before
+
+
+# --- a missing row parked at the target path ----------------------------------------------
+
+def _parked(session, path: Path, *, mtime_ns: int = 1, hash_value: str | None = None) -> PruneRow:
+    """A retired row at ``path`` with one record, as the old bug or an offline folder left it."""
+    row = _row(session, path)
+    content = session.get(AssetContent, row.content_id)
+    content.mtime_ns, content.hash = mtime_ns, hash_value
+    mark_content_missing(session, row.content_id)
+    session.flush()
+    return row
+
+
+def test_a_parked_stub_does_not_hold_up_a_rehome(folders, session, temp_dir):
+    real = temp_dir / "real"
+    _populate(real, ("f.png",))
+    folders.use(output=real, models=None)
+    _parked(session, real / "f.png")
+    mover = _row(session, _alias(real, temp_dir / "alias") / "f.png")
+
+    result = mark_contents_missing_outside_prefixes(session, [str(real)])
+
+    assert (result.rehomed, result.conflict_retired) == (1, 0)
+    assert _live(session, mover.content_id) == str(real / "f.png")
+
+
+def test_parked_history_joins_a_mover_that_has_its_own(folders, session, temp_dir):
+    real = temp_dir / "real"
+    _populate(real, ("f.png",))
+    folders.use(output=real, models=None)
+    parked = _parked(session, real / "f.png")
+    mover = _row(session, _alias(real, temp_dir / "alias") / "f.png")
+    parked_record, mover_record = _record_of(session, parked.content_id), _record_of(session, mover.content_id)
+    parked_record.job_id, mover_record.job_id = "job-before-the-split", "job-after-the-split"
+    session.flush()
+
+    result = mark_contents_missing_outside_prefixes(session, [str(real)])
+
+    assert (result.rehomed, result.merged_records) == (1, 1)
+    assert _live(session, mover.content_id) == str(real / "f.png")
+    assert _records_on(session, mover.content_id) == {parked_record.id, mover_record.id}
+    assert "missing" not in fetch_record_tags(session, parked_record.id)
+
+
+@pytest.mark.parametrize("hashing", [False, True], ids=["hashing-off", "hashing-on"])
+def test_with_hashing_on_a_hashed_parked_row_is_recoverable_despite_a_new_mtime(
+    folders, session, temp_dir, hashing
+):
+    """Recovery with hashing on matches the hash, not the mtime, so the path is left to it."""
+
+    class _Hashing:
+        enable_asset_hashing = hashing
+
+    mode.init(_Hashing())
+    real = temp_dir / "real"
+    _populate(real, ("f.png",))
+    folders.use(output=real, models=None)
+    parked = _parked(session, real / "f.png", mtime_ns=999, hash_value="blake3:" + "0" * 64)
+    _record_of(session, parked.content_id).job_id = "job-before-the-split"
+    mover = _row(session, _alias(real, temp_dir / "alias") / "f.png")
+    session.flush()
+
+    result = mark_contents_missing_outside_prefixes(session, [str(real)])
+
+    if hashing:
+        assert (result.rehomed, result.conflict_retired) == (0, 1)
+        assert _live(session, mover.content_id) is None
+    else:
+        # Different mtime and no hashing: recovery would not take it, so the mover re-homes.
+        assert (result.rehomed, result.conflict_retired) == (1, 0)
+
+
+def test_an_integrity_error_other_than_a_path_race_is_not_swallowed(folders, session, temp_dir, monkeypatch):
+    real = temp_dir / "real"
+    _populate(real, ("f.png",))
+    folders.use(output=real, models=None)
+    _row(session, _alias(real, temp_dir / "alias") / "f.png")
+
+    def foreign_key_failure(*_args, **_kwargs):
+        raise IntegrityError("UPDATE", {}, Exception("FOREIGN KEY constraint failed"))
+
+    monkeypatch.setattr(scanner_rehome, "_live_occupants", lambda _session, _paths: {})
+    original_execute = session.execute
+
+    def failing_update(statement, *args, **kwargs):
+        if getattr(statement, "is_update", False):
+            foreign_key_failure()
+        return original_execute(statement, *args, **kwargs)
+
+    monkeypatch.setattr(session, "execute", failing_update)
+
+    with pytest.raises(IntegrityError):
+        mark_contents_missing_outside_prefixes(session, [str(real)])
