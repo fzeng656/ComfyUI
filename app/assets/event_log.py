@@ -89,6 +89,8 @@ ALLOWED_FIELDS: dict[str, Callable[[Any], bool]] = {
     "hash_failed": _is_count,
     "enrich_failed": _is_count,
     "permission_denied": _is_count,
+    "missing_marked_count": _is_count,
+    "recovered_count": _is_count,
     "count": _is_count,
     "rehomed_count": _is_count,
     "still_present_count": _is_count,
