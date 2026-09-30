@@ -341,7 +341,13 @@ def mark_contents_missing_outside_prefixes(
     session: Session, prefixes: list[str]
 ) -> PruneResult:
     rows = session.execute(
-        sa.select(AssetContent.id, AssetContent.path, AssetContent.created_at)
+        sa.select(
+            AssetContent.id,
+            AssetContent.path,
+            AssetContent.created_at,
+            AssetContent.size_bytes,
+            AssetContent.mtime_ns,
+        )
         .where(AssetContent.is_missing.is_(False))
         .execution_options(yield_per=500)
     )
@@ -349,14 +355,15 @@ def mark_contents_missing_outside_prefixes(
     respell = CaseRespeller(prefixes)
     respelled: list[RespelledRow] = []
     unowned: list[PruneRow] = []
-    for content_id, path, created_at in rows:
+    for content_id, path, created_at, size_bytes, mtime_ns in rows:
+        row = PruneRow(content_id, path, created_at, size_bytes, mtime_ns)
         if not is_owned(path):
-            unowned.append(PruneRow(content_id, path, created_at))
+            unowned.append(row)
         elif respell.folds_case:
             spellings = respell(path)
             # Spelled for one of its folder's registered spellings already: leave it.
             if spellings is not None and all(new_path != path for new_path, _ in spellings):
-                respelled.append(RespelledRow(PruneRow(content_id, path, created_at), spellings))
+                respelled.append(RespelledRow(row, spellings))
     # The plan only reads the filesystem, so no write is pending while it stats.
     plan = plan_prune(respelled, unowned, prefixes)
     return apply_prune_plan(session, plan)

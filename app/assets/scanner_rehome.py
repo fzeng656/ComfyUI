@@ -72,6 +72,8 @@ class PruneRow(NamedTuple):
     content_id: str
     path: str
     created_at: datetime
+    size_bytes: int | None = None
+    mtime_ns: int | None = None
 
 
 class RespelledRow(NamedTuple):
@@ -521,6 +523,34 @@ def _record_history(
     return history
 
 
+def _missing_rows(session: Session, paths: Sequence[str]) -> dict[str, list[PruneRow]]:
+    """Missing rows at ``paths`` that still have a record: the ones recovery can restore.
+
+    No index serves a missing row's path, so this is one pass over the missing rows
+    rather than one per batch of paths.
+    """
+    wanted = set(paths)
+    rows: dict[str, list[PruneRow]] = {}
+    if not wanted:
+        return rows
+    stmt = (
+        sa.select(
+            AssetContent.id,
+            AssetContent.path,
+            AssetContent.created_at,
+            AssetContent.size_bytes,
+            AssetContent.mtime_ns,
+        )
+        .where(AssetContent.is_missing.is_(True))
+        .where(sa.exists().where(Asset.content_id == AssetContent.id))
+        .execution_options(yield_per=_BATCH)
+    )
+    for content_id, path, created_at, size_bytes, mtime_ns in session.execute(stmt):
+        if path in wanted:
+            rows.setdefault(path, []).append(PruneRow(content_id, path, created_at, size_bytes, mtime_ns))
+    return rows
+
+
 def _live_occupants(session: Session, paths: Sequence[str]) -> dict[str, PruneRow]:
     occupants: dict[str, PruneRow] = {}
     for chunk in _batches(list(paths)):
@@ -613,9 +643,18 @@ def apply_prune_plan(session: Session, plan: PrunePlan) -> PruneResult:
         new_path: rows if new_path not in occupants else [*rows, occupants[new_path]]
         for new_path, rows in by_target.items()
     }
+    # A free path may still hold a missing row with the user's history: a folder that
+    # was catalogued under this spelling, lost under another one (retired, and re-created
+    # there as stubs), and is now spelled as it was. The scan's recovery restores such a
+    # row, but only while the path stays free; a stub re-homed onto it would block that.
+    parked = _missing_rows(session, [path for path in by_target if path not in occupants])
     history = _record_history(
         session,
-        {row.content_id: new_path for new_path, rows in contested.items() if len(rows) > 1 for row in rows},
+        {
+            **{row.content_id: path for path, rows in parked.items() for row in rows},
+            **{row.content_id: new_path for new_path, rows in contested.items() if len(rows) > 1 for row in rows},
+            **{row.content_id: path for path in parked for row in by_target[path]},
+        },
         role_of,
     )
 
@@ -625,6 +664,16 @@ def apply_prune_plan(session: Session, plan: PrunePlan) -> PruneResult:
     targets: list[_Target] = []
     for new_path, contenders in contested.items():
         occupant = occupants.get(new_path)
+        stats = {(row.size_bytes, row.mtime_ns) for row in contenders}
+        recoverable = [
+            row for row in parked.get(new_path, ()) if has_history(row) and (row.size_bytes, row.mtime_ns) in stats
+        ]
+        if recoverable and not any(has_history(row) for row in contenders):
+            # Leave the path to the scan's recovery: retire the stubs at their own
+            # spellings. A mover with history of its own is re-homed as usual instead,
+            # rather than leaving its edits on a row that recovery might not restore.
+            targets.append(_Target(None, [row.content_id for row in contenders], [], 0))
+            continue
         # A live row already at the path keeps it, so every retired row stays at its own
         # old spelling, which no scan visits. A retired row left at the live path would
         # compete with the kept one when an offline folder's rows are later recovered.

@@ -9,6 +9,7 @@ import os
 import posixpath
 import threading
 import time
+from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -21,12 +22,15 @@ from sqlalchemy.orm import Session as SASession, sessionmaker
 import folder_paths
 from app.assets import scanner_rehome, seeder as seeder_module
 from app.assets.database.models import Asset, AssetContent
+from app.assets import mode
+from app.assets.helpers import cached_prefix_matcher
 from app.assets.database.queries.records import (
     create_content,
     create_record,
     ensure_tag,
     ensure_tag_link,
     fetch_record_tags,
+    mark_content_missing,
 )
 from app.assets.scanner_admission import _WATCH_LIST
 from app.assets.scanner import mark_contents_missing_outside_prefixes
@@ -233,10 +237,15 @@ def test_a_different_folder_with_the_same_layout_is_not_rehomed(folders, temp_di
 
 
 @pytest.fixture
-def folds_case(monkeypatch: pytest.MonkeyPatch) -> None:
+def folds_case(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     """Compare paths the way Windows does. The filesystem stays case-sensitive, so the
     tests reach one folder under two spellings through a symlink."""
     monkeypatch.setattr(posixpath, "normcase", lambda path: os.fspath(path).lower())
+    # Matchers are cached per prefix with normcase applied; one built under the patch
+    # must not outlive it (macOS temp paths hold capitals, so it would then mismatch).
+    cached_prefix_matcher.cache_clear()
+    yield
+    cached_prefix_matcher.cache_clear()
 
 
 def test_a_case_only_respelling_neither_duplicates_nor_retires(folders, folds_case, temp_dir, session, caplog):
@@ -822,8 +831,10 @@ def test_a_healed_file_that_goes_offline_comes_back_with_its_history(folders, te
     create_record(session, content_id=duplicate.id, name="f.png", loader_path="f.png", tags=["output"])
     session.commit()
     with patch.object(posixpath, "normcase", lambda path: os.fspath(path).lower()):
+        cached_prefix_matcher.cache_clear()
         folders.use(output=real, models=None)
         _boot()
+    cached_prefix_matcher.cache_clear()
     assert _records(session) == _respelled(before, upper, real)
 
     folders.use(output=None, models=None)  # the folder is missing for one startup
@@ -902,3 +913,46 @@ def test_a_non_strict_mime_guess_is_not_history(folders, session, temp_dir):
     mark_contents_missing_outside_prefixes(session, [str(real)])
 
     assert _records_on(session, newer.content_id) == {history.id}
+
+
+@pytest.mark.parametrize("hashing", [False, True], ids=["hashing-off", "hashing-on"])
+def test_a_folder_split_by_the_old_bug_gets_its_history_back_when_spelled_as_before(
+    folders, temp_dir, session, hashing
+):
+    """Users already hit by the original bug: their edited rows were retired under the
+    first spelling and re-created as stubs under a second. Spelled as before again, the
+    stubs must not be re-homed over the paths, or recovery can never restore the rows
+    that carry the history."""
+
+    class _Hashing:
+        enable_asset_hashing = hashing
+
+    mode.init(_Hashing())
+    real = temp_dir / "real" / "output"
+    _populate(real, OUTPUT_FILES)
+    first = _alias(temp_dir / "real", temp_dir / "first") / "output"
+    second = _alias(temp_dir / "real", temp_dir / "second") / "output"
+    folders.use(output=first, models=None)
+    _boot()
+    _rename_all(session)
+    before = _records(session)
+    # What the old Core did when started with the second spelling.
+    for content in session.scalars(sa.select(AssetContent).where(AssetContent.is_missing.is_(False))).all():
+        mark_content_missing(session, content.id)
+        name = content.path[len(str(first)) + 1:]
+        stub = create_content(
+            session, path=str(second / name), size_bytes=content.size_bytes, mtime_ns=content.mtime_ns
+        )
+        create_record(
+            session,
+            content_id=stub.id,
+            name=os.path.basename(name),
+            loader_path=name.replace(os.sep, "/"),
+            tags=["output"],
+        )
+    session.commit()
+
+    folders.use(output=first, models=None)
+    assert _boot() == 0
+
+    assert _records(session) == before
