@@ -347,6 +347,7 @@ def mark_contents_missing_outside_prefixes(
             AssetContent.created_at,
             AssetContent.size_bytes,
             AssetContent.mtime_ns,
+            AssetContent.hash,
         )
         .where(AssetContent.is_missing.is_(False))
         .execution_options(yield_per=500)
@@ -355,8 +356,8 @@ def mark_contents_missing_outside_prefixes(
     respell = CaseRespeller(prefixes)
     respelled: list[RespelledRow] = []
     unowned: list[PruneRow] = []
-    for content_id, path, created_at, size_bytes, mtime_ns in rows:
-        row = PruneRow(content_id, path, created_at, size_bytes, mtime_ns)
+    for content_id, path, created_at, size_bytes, mtime_ns, hash_value in rows:
+        row = PruneRow(content_id, path, created_at, size_bytes, mtime_ns, hash_value)
         if not is_owned(path):
             unowned.append(row)
         elif respell.folds_case:

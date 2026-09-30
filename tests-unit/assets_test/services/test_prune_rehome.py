@@ -24,7 +24,8 @@ import folder_paths
 from app.assets import scanner_rehome, seeder as seeder_module
 from app.assets.database.models import Asset, AssetContent
 from app.assets import mode
-from app.assets.helpers import cached_prefix_matcher
+from app.assets.helpers import cached_prefix_matcher, to_stored_hash
+from app.assets.services.snapshot_hash import snapshot_hash
 from app.assets.database.queries.records import (
     create_content,
     create_record,
@@ -1002,32 +1003,67 @@ def test_parked_history_joins_a_mover_that_has_its_own(folders, session, temp_di
     assert "missing" not in fetch_record_tags(session, parked_record.id)
 
 
-@pytest.mark.parametrize("hashing", [False, True], ids=["hashing-off", "hashing-on"])
-def test_with_hashing_on_a_hashed_parked_row_is_recoverable_despite_a_new_mtime(
-    folders, session, temp_dir, hashing
-):
-    """Recovery with hashing on matches the hash, not the mtime, so the path is left to it."""
-
+@pytest.fixture
+def hashing_on() -> None:
     class _Hashing:
-        enable_asset_hashing = hashing
+        enable_asset_hashing = True
 
     mode.init(_Hashing())
+
+
+def _digest(path: Path) -> str:
+    digest, _ = snapshot_hash(str(path))
+    return to_stored_hash(digest)
+
+
+@pytest.mark.parametrize("same_bytes", [True, False], ids=["same-bytes", "different-bytes"])
+def test_with_hashing_on_recovery_decides_a_parked_row_with_a_new_mtime(
+    folders, hashing_on, session, temp_dir, same_bytes
+):
+    """The prune leaves the path to recovery, which restores the parked row only if its
+    stored digest is the file's."""
     real = temp_dir / "real"
     _populate(real, ("f.png",))
     folders.use(output=real, models=None)
-    parked = _parked(session, real / "f.png", mtime_ns=999, hash_value="blake3:" + "0" * 64)
-    _record_of(session, parked.content_id).job_id = "job-before-the-split"
+    stored = _digest(real / "f.png") if same_bytes else "blake3:" + "0" * 64
+    parked = _parked(session, real / "f.png", mtime_ns=999, hash_value=stored)
+    history = _record_of(session, parked.content_id)
+    history.job_id = "job-before-the-split"
+    _row(session, _alias(real, temp_dir / "alias") / "f.png")
+    session.commit()
+
+    _boot()
+
+    live = _records(session)
+    assert (history.id in live) is same_bytes
+    assert len(live) == 1  # the history row, or a fresh one for different bytes
+
+
+@pytest.mark.parametrize(
+    ("parked_hash", "mover_hash", "merges"),
+    [("blake3:" + "1" * 64, "blake3:" + "1" * 64, True), ("blake3:" + "1" * 64, "blake3:" + "2" * 64, False),
+     ("blake3:" + "1" * 64, None, False)],
+    ids=["same-digest", "different-digest", "mover-not-hashed"],
+)
+def test_with_hashing_on_parked_history_joins_a_mover_only_on_a_proven_digest(
+    folders, hashing_on, session, temp_dir, parked_hash, mover_hash, merges
+):
+    real = temp_dir / "real"
+    _populate(real, ("f.png",))
+    folders.use(output=real, models=None)
+    parked = _parked(session, real / "f.png", mtime_ns=999, hash_value=parked_hash)
+    parked_record = _record_of(session, parked.content_id)
+    parked_record.job_id = "job-before-the-split"
     mover = _row(session, _alias(real, temp_dir / "alias") / "f.png")
+    session.get(AssetContent, mover.content_id).hash = mover_hash
+    _record_of(session, mover.content_id).job_id = "job-after-the-split"
     session.flush()
 
     result = mark_contents_missing_outside_prefixes(session, [str(real)])
 
-    if hashing:
-        assert (result.rehomed, result.conflict_retired) == (0, 1)
-        assert _live(session, mover.content_id) is None
-    else:
-        # Different mtime and no hashing: recovery would not take it, so the mover re-homes.
-        assert (result.rehomed, result.conflict_retired) == (1, 0)
+    assert result.rehomed == 1
+    assert (parked_record.id in _records_on(session, mover.content_id)) is merges
+    assert ("missing" in fetch_record_tags(session, parked_record.id)) is not merges
 
 
 def test_an_integrity_error_other_than_a_path_race_is_not_swallowed(folders, session, temp_dir, monkeypatch):

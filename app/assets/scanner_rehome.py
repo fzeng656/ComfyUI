@@ -526,10 +526,16 @@ def _record_history(
     return history
 
 
-def _recovery_would_match(parked: PruneRow, mover: PruneRow, hashing: bool) -> bool:
+def _same_file(parked: PruneRow, mover: PruneRow, hashing: bool) -> bool | None:
+    """Whether the scan's recovery would take ``parked`` for ``mover``'s file, by its
+    own rules: with hashing on and a stored hash, the digests must be equal; otherwise
+    size and mtime. None when only recovery can tell: the parked row has a hash and
+    the mover does not, so the file has to be hashed first."""
     if parked.size_bytes != mover.size_bytes:
         return False
-    return parked.mtime_ns == mover.mtime_ns or (hashing and parked.hash is not None)
+    if hashing and parked.hash is not None:
+        return None if mover.hash is None else parked.hash == mover.hash
+    return parked.mtime_ns == mover.mtime_ns
 
 
 def _missing_rows(session: Session, paths: Sequence[str]) -> dict[str, list[PruneRow]]:
@@ -686,14 +692,17 @@ def apply_prune_plan(session: Session, plan: PrunePlan) -> PruneResult:
     targets: list[_Target] = []
     for new_path, contenders in contested.items():
         occupant = occupants.get(new_path)
-        # Parked rows the scan's recovery would take for this same file: same size, and
-        # the same mtime, or (with hashing on) a stored hash it can compare.
-        recoverable = [
-            row
+        # Parked rows with history that the scan's recovery could take for this file.
+        # Leaving the path to recovery needs only that it might: recovery checks the
+        # file itself. Moving their history onto a mover needs it proven here.
+        verdicts = {
+            row.content_id: [_same_file(row, mover, hashing) for mover in contenders]
             for row in parked.get(new_path, ())
-            if has_history(row) and any(_recovery_would_match(row, mover, hashing) for mover in contenders)
-        ]
-        if recoverable and not any(has_history(row) for row in contenders):
+            if has_history(row)
+        }
+        possible = [content_id for content_id, found in verdicts.items() if any(v is not False for v in found)]
+        proven = [content_id for content_id, found in verdicts.items() if any(v is True for v in found)]
+        if possible and not any(has_history(row) for row in contenders):
             # Leave the path to the scan's recovery: retire the stubs at their own
             # spellings, so the history row comes back with its own id.
             targets.append(_Target(None, [row.content_id for row in contenders], [], 0))
@@ -727,7 +736,7 @@ def apply_prune_plan(session: Session, plan: PrunePlan) -> PruneResult:
         # A mover with history of its own keeps the path; the recoverable rows' history
         # joins it, so none is left behind on a missing row at a live path.
         revived = tuple(
-            record_id for row in recoverable for record_id, carries in history.get(row.content_id, ()) if carries
+            record_id for content_id in proven for record_id, carries in history.get(content_id, ()) if carries
         )
         moved_records.extend({"id": record_id, "content_id": host.content_id} for record_id in revived)
         merged += len(revived)
