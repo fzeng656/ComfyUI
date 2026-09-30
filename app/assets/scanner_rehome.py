@@ -166,6 +166,9 @@ class _FolderResolver:
 
     def dir_stat(self, directory: str) -> os.stat_result | None:
         if directory not in self._stats:
+            # Recorded as unreachable first: if this stat hangs, the worker is abandoned
+            # and its replacement moves on instead of stalling on the same directory.
+            self._stats[directory] = None
             self._stats[directory] = _stat_or_none(directory)
         return self._stats[directory]
 
@@ -264,6 +267,7 @@ class _Watchdog:
     def run(self, jobs: Sequence[Callable[[], object]]) -> list:
         results: list = [_UNKNOWN] * len(jobs)
         lock = threading.Lock()
+        retried: set[int] = set()
         start = 0
         while start < len(jobs) and self.stalls < MAX_STALLS:
             worker = _Worker(jobs, start, results, lock)
@@ -272,7 +276,12 @@ class _Watchdog:
                 if time.monotonic() - worker.last_progress > STALL_SECONDS:
                     with lock:
                         worker.abandoned = True
-                        start = worker.index + 1
+                        stuck = worker.index
+                    # Retry the stuck job once: the directory it hung on is now recorded
+                    # as unreachable, so a stall on a shared folder (a registered one,
+                    # say) does not cost this job. A second stall on it skips it.
+                    start = stuck + 1 if stuck in retried else stuck
+                    retried.add(stuck)
                     self.stalls += 1
                     logging.warning(
                         "Asset prune: a filesystem check made no progress for %.0fs "
@@ -411,6 +420,13 @@ def _record_roles(session: Session, content_ids: Sequence[str]) -> dict[str, lis
     return roles
 
 
+_ROOT_TAGS = frozenset({"input", "output", "temp", "models"})
+
+
+def _role_tags(tags: frozenset[str]) -> frozenset[str]:
+    return frozenset(tag for tag in tags if tag in _ROOT_TAGS or tag.startswith("model_type:"))
+
+
 class _RoleDeriver:
     """The tags and loader path a path would be catalogued with. Both depend only on
     the folder and the extension, so they are derived once per pair."""
@@ -440,14 +456,19 @@ class _RoleDeriver:
         return tags, None if stem is None else stem + name
 
     def fits(self, path: str, records: Sequence[_RecordRole]) -> bool:
-        """Whether the row's records would be catalogued at ``path`` as they already
-        are: the same loader path, and every tag the path implies."""
+        """Whether ``path`` plays the role the row's records were catalogued in: the
+        same loader path, the same root (input, output, temp or models), and every
+        model category the records claim. A category registered since cataloguing
+        does not count against it: tags are fixed at creation."""
         derived = self(path)
         if derived is None:
             return False
         tags, loader_path = derived
+        roots = tags & _ROOT_TAGS
         return all(
-            (stored is None or stored == loader_path) and tags <= stored_tags
+            (stored is None or stored == loader_path)
+            and roots <= stored_tags
+            and _role_tags(stored_tags) <= tags
             for stored, stored_tags in records
         )
 
@@ -482,15 +503,16 @@ def _record_history(
                 tags.setdefault(record_id, set()).add(tag_name)
         for record in records:
             path = path_of[record.content_id]
-            # The scan sets the extension's guess; anything else was set by a user.
-            scanned_mime = mimetypes.guess_type(path)[0]
+            # A scan sets the extension's guess (strict, or not on the watch list);
+            # anything else was set by a user.
+            scanned_mimes = {None, mimetypes.guess_type(path)[0], mimetypes.guess_type(path, strict=False)[0]}
             derived = role_of(path)
             derived_tags = derived[0] if derived is not None else frozenset()
             has_history = (
                 record.job_id is not None
                 or record.user_metadata is not None
                 or record.preview_id is not None
-                or record.mime_type not in (None, scanned_mime)
+                or record.mime_type not in scanned_mimes
                 or record.updated_at - record.created_at > _EDITED_AFTER
                 or record.name != os.path.basename(path)
                 or bool(tags.get(record.id, set()) - derived_tags)
@@ -515,9 +537,10 @@ class _Target(NamedTuple):
     """One contested or re-homed path, applied as a unit: its records move, its
     losers retire and its winner is rewritten together, or none of them happen."""
 
-    rewrite: dict[str, str] | None  # the winner's new path, None when it already holds it
+    rewrite: dict[str, str] | None  # the kept row's new path, None when it already holds it
     losers: list[str]
-    moved_records: list[dict[str, str]]
+    moved_records: list[dict[str, str]]  # record re-points: history in, and any stubs out
+    merged: int  # records with history moved onto the kept row
 
 
 def _apply_targets(session: Session, targets: Sequence[_Target]) -> list[_Target]:
@@ -563,11 +586,11 @@ def apply_prune_plan(session: Session, plan: PrunePlan) -> PruneResult:
 
     A row re-homes to its first candidate in its own role, or is retired if it has
     none. Where a new path is already held by a live row (a duplicate made under
-    another spelling), or two rows move to one path, the oldest row keeps it and the
-    others are retired: marked missing, never deleted. A row whose records carry
-    history wins over one with only untouched scan stubs. Records on a retired
-    duplicate that carry history move to the kept row first; only untouched stubs
-    stay behind.
+    another spelling), that row keeps it; where only moving rows want a path, the one
+    carrying history keeps it, then the oldest. The others are retired at their old
+    spellings: marked missing, never deleted. Records carrying history move onto the
+    kept row first, and if the kept row had only untouched scan stubs, those go to the
+    retired row instead, so the file is listed once.
     """
     retire = list(plan.retire)
     still_present = plan.still_present
@@ -602,21 +625,33 @@ def apply_prune_plan(session: Session, plan: PrunePlan) -> PruneResult:
     targets: list[_Target] = []
     for new_path, contenders in contested.items():
         occupant = occupants.get(new_path)
-        # A row carrying history keeps the path over an untouched stub, then the oldest,
-        # so a healed file is listed once.
-        winner = min(contenders, key=lambda row: (not has_history(row), row.created_at, row.content_id))
-        losers = [row.content_id for row in contenders if row is not winner]
+        # A live row already at the path keeps it, so every retired row stays at its own
+        # old spelling, which no scan visits. A retired row left at the live path would
+        # compete with the kept one when an offline folder's rows are later recovered.
+        # Among movers alone, a row carrying history wins, then the oldest.
+        host = occupant or min(
+            contenders, key=lambda row: (not has_history(row), row.created_at, row.content_id)
+        )
+        losers = [row for row in contenders if row is not host]
         # Nothing is merged field by field: a content may hold several records (a
-        # cached output adds one per delivery), and each keeps its own fields. An
-        # untouched stub stays on the retired row, so the file is not listed twice.
+        # cached output adds one per delivery), and each keeps its own fields.
         moved_records = [
-            {"id": record_id, "content_id": winner.content_id}
-            for content_id in losers
-            for record_id, carries in history.get(content_id, ())
+            {"id": record_id, "content_id": host.content_id}
+            for loser in losers
+            for record_id, carries in history.get(loser.content_id, ())
             if carries
         ]
-        rewrite = None if winner is occupant else {"id": winner.content_id, "path": new_path}
-        targets.append(_Target(rewrite, losers, moved_records))
+        merged = len(moved_records)
+        donor = next((loser for loser in losers if has_history(loser)), None)
+        if donor is not None and not has_history(host):
+            # The kept row's untouched stubs go to the retired row that brought the
+            # history, so the healed file is listed once. Nothing is deleted.
+            moved_records.extend(
+                {"id": record_id, "content_id": donor.content_id}
+                for record_id, _ in history.get(host.content_id, ())
+            )
+        rewrite = None if host is occupant else {"id": host.content_id, "path": new_path}
+        targets.append(_Target(rewrite, [loser.content_id for loser in losers], moved_records, merged))
 
     for content_id in retire:
         mark_content_missing(session, content_id)
@@ -628,5 +663,5 @@ def apply_prune_plan(session: Session, plan: PrunePlan) -> PruneResult:
         rehomed=sum(target.rewrite is not None for target in applied),
         still_present=still_present,
         conflict_retired=losers_retired,
-        merged_records=sum(len(target.moved_records) for target in applied),
+        merged_records=sum(target.merged for target in applied),
     )

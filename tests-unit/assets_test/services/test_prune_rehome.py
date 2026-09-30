@@ -4,6 +4,7 @@ spelling instead of retiring it. Boots are the prune followed by the seeder's re
 fast phase, on an in-memory catalog."""
 
 import logging
+import mimetypes
 import os
 import posixpath
 import threading
@@ -255,7 +256,7 @@ def test_a_case_only_respelling_neither_duplicates_nor_retires(folders, folds_ca
     assert _marked_missing_event(caplog)["rehomed_count"] == str(len(OUTPUT_FILES))
 
 
-def test_existing_case_duplicates_heal_keeping_the_older_row(folders, folds_case, temp_dir, session, caplog):
+def test_existing_case_duplicates_heal_keeping_the_original_records(folders, folds_case, temp_dir, session, caplog):
     real = temp_dir / "data" / "output"
     _populate(real, OUTPUT_FILES)
     upper = _case_variant(temp_dir / "data", temp_dir / "DATA") / "output"
@@ -266,7 +267,8 @@ def test_existing_case_duplicates_heal_keeping_the_older_row(folders, folds_case
     # What a case-only relaunch left behind before this fix: a newer live duplicate of every file.
     later = datetime.now() + timedelta(days=1)
     for name in OUTPUT_FILES:
-        content = create_content(session, path=str(real / name), size_bytes=1, mtime_ns=1)
+        stat = (real / name).stat()
+        content = create_content(session, path=str(real / name), size_bytes=stat.st_size, mtime_ns=stat.st_mtime_ns)
         content.created_at = later
         create_record(
             session,
@@ -283,8 +285,11 @@ def test_existing_case_duplicates_heal_keeping_the_older_row(folders, folds_case
     assert _records(session) == _respelled(before, upper, real)
     assert _missing_count(session) == len(OUTPUT_FILES)
     event = _marked_missing_event(caplog)
+    # The live duplicates keep their paths; the originals' records move onto them, and
+    # their untouched stubs retire with the originals.
     assert event["conflict_retired_count"] == str(len(OUTPUT_FILES))
-    assert event["rehomed_count"] == str(len(OUTPUT_FILES))
+    assert event["merged_records_count"] == str(len(OUTPUT_FILES))
+    assert event["rehomed_count"] == "0"
 
 
 # --- the plan, row by row ----------------------------------------------------------------
@@ -657,23 +662,38 @@ def test_both_duplicates_keep_their_tags_and_job_links_on_the_kept_row(folders, 
 
     result = mark_contents_missing_outside_prefixes(session, [str(temp_dir / "real")])
 
-    assert (result.rehomed, result.conflict_retired, result.merged_records) == (1, 1, 1)
-    assert _live(session, older.content_id) == str(temp_dir / "real" / "f.png")
-    assert _live(session, newer.content_id) is None
-    assert _records_on(session, older.content_id) == {older_record.id, newer_record.id}
-    assert {"new-tag", "output"} <= set(fetch_record_tags(session, newer_record.id))
-    assert "missing" not in fetch_record_tags(session, newer_record.id)
-    assert session.get(Asset, newer_record.id).job_id == "job-new"
+    assert (result.rehomed, result.conflict_retired, result.merged_records) == (0, 1, 1)
+    assert _live(session, newer.content_id) == str(temp_dir / "real" / "f.png")
+    assert _live(session, older.content_id) is None
+    assert _records_on(session, newer.content_id) == {older_record.id, newer_record.id}
+    assert {"old-tag", "output"} <= set(fetch_record_tags(session, older_record.id))
+    assert "missing" not in fetch_record_tags(session, older_record.id)
+    assert session.get(Asset, older_record.id).job_id == "job-old"
 
 
-def test_an_untouched_scan_stub_on_the_newer_duplicate_stays_retired(folders, session, temp_dir):
+def test_of_two_untouched_stubs_the_live_one_stays(folders, session, temp_dir):
     older, newer = _duplicate_pair(folders, session, temp_dir)
-    stub = _record_of(session, newer.content_id)
+    older_stub, newer_stub = _record_of(session, older.content_id), _record_of(session, newer.content_id)
 
     result = mark_contents_missing_outside_prefixes(session, [str(temp_dir / "real")])
 
     assert (result.conflict_retired, result.merged_records) == (1, 0)
-    assert _records_on(session, newer.content_id) == {stub.id}
+    assert _live(session, newer.content_id) == str(temp_dir / "real" / "f.png")
+    assert _records_on(session, newer.content_id) == {newer_stub.id}
+    assert "missing" in fetch_record_tags(session, older_stub.id)
+
+
+def test_history_moving_in_sends_the_kept_rows_stub_to_the_retired_row(folders, session, temp_dir):
+    """The healed file is listed once, and nothing is deleted."""
+    older, newer = _duplicate_pair(folders, session, temp_dir)
+    history, stub = _record_of(session, older.content_id), _record_of(session, newer.content_id)
+    history.job_id = "job-old"
+    session.flush()
+
+    mark_contents_missing_outside_prefixes(session, [str(temp_dir / "real")])
+
+    assert _records_on(session, newer.content_id) == {history.id}
+    assert _records_on(session, older.content_id) == {stub.id}
     assert "missing" in fetch_record_tags(session, stub.id)
 
 
@@ -746,13 +766,15 @@ def test_a_mime_only_edit_right_after_creation_counts_as_history(folders, sessio
 
 def test_the_scans_own_mime_guess_is_not_history(folders, session, temp_dir):
     older, newer = _duplicate_pair(folders, session, temp_dir)
-    _record_of(session, newer.content_id).mime_type = "image/png"
+    history, scanned = _record_of(session, older.content_id), _record_of(session, newer.content_id)
+    history.job_id = "job-old"
+    scanned.mime_type = "image/png"
     session.flush()
 
     mark_contents_missing_outside_prefixes(session, [str(temp_dir / "real")])
 
-    assert _live(session, older.content_id) == str(temp_dir / "real" / "f.png")
-    assert _live(session, newer.content_id) is None
+    # A stub: it leaves the kept row for the retired one.
+    assert _records_on(session, newer.content_id) == {history.id}
 
 
 def test_a_contested_target_taken_by_a_racing_writer_rolls_back_whole(folders, session, temp_dir, monkeypatch):
@@ -780,3 +802,103 @@ def test_a_contested_target_taken_by_a_racing_writer_rolls_back_whole(folders, s
     assert _records_on(session, stub.content_id) == {stub_record.id}
     assert _live(session, racer.content_id) == str(real / "f.png")
     assert _live(session, moved.content_id) == str(real / "g.png")
+
+
+
+def test_a_healed_file_that_goes_offline_comes_back_with_its_history(folders, temp_dir, session):
+    """The retired duplicate stays at its old spelling, so when the folder is later
+    missing for a startup and returns, only the kept row is at the live path to
+    recover."""
+    real = temp_dir / "data" / "output"
+    _populate(real, ("f.png",))
+    upper = _case_variant(temp_dir / "data", temp_dir / "DATA") / "output"
+    folders.use(output=upper, models=None)
+    _boot()
+    _rename_all(session)
+    before = _records(session)
+    stat = (real / "f.png").stat()
+    duplicate = create_content(session, path=str(real / "f.png"), size_bytes=stat.st_size, mtime_ns=stat.st_mtime_ns)
+    duplicate.created_at = datetime.now() + timedelta(days=1)
+    create_record(session, content_id=duplicate.id, name="f.png", loader_path="f.png", tags=["output"])
+    session.commit()
+    with patch.object(posixpath, "normcase", lambda path: os.fspath(path).lower()):
+        folders.use(output=real, models=None)
+        _boot()
+    assert _records(session) == _respelled(before, upper, real)
+
+    folders.use(output=None, models=None)  # the folder is missing for one startup
+    _boot()
+    assert _records(session) == {}
+    folders.use(output=real, models=None)
+    assert _boot() == 0
+
+    assert _records(session) == _respelled(before, upper, real)
+
+
+def test_a_model_category_registered_since_cataloguing_does_not_block_a_rehome(monkeypatch, temp_dir):
+    shared = temp_dir / "shared"
+    shared.mkdir()
+    monkeypatch.setattr(
+        folder_paths,
+        "folder_names_and_paths",
+        {"checkpoints": ([str(shared)], {".safetensors"}), "loras": ([str(shared)], {".safetensors"})},
+    )
+    path = str(shared / "m.safetensors")
+    role_of = scanner_rehome._RoleDeriver()
+
+    catalogued_before_loras = ("m.safetensors", frozenset({"models", "model_type:checkpoints"}))
+    assert role_of.fits(path, [catalogued_before_loras])
+    assert not role_of.fits(path, [("m.safetensors", frozenset({"models", "model_type:vae"}))])
+    assert not role_of.fits(path, [("m.safetensors", frozenset({"output"}))])
+
+
+def test_a_hung_registered_folder_does_not_stop_other_rehomes(folders, session, temp_dir, monkeypatch):
+    real = temp_dir / "real"
+    _populate(real, ("f.png",))
+    folders.use(output=real, models=None)
+    row = _row(session, _alias(real, temp_dir / "alias") / "f.png")
+    hung = temp_dir / "hung-share"
+    monkeypatch.setattr(scanner_rehome, "STALL_SECONDS", 0.2)
+    release = threading.Event()
+    real_stat = os.stat
+
+    def hard_mount(path, *args, **kwargs):
+        if os.fspath(path) == str(hung):
+            release.wait(30)
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "stat", hard_mount)
+    try:
+        result = mark_contents_missing_outside_prefixes(session, [str(hung), str(real)])
+    finally:
+        release.set()
+
+    assert (result.marked, result.rehomed) == (0, 1)
+    assert _live(session, row.content_id) == str(real / "f.png")
+
+
+def test_a_non_strict_mime_guess_is_not_history(folders, session, temp_dir):
+    """The watch list admits files with the non-strict guess, so it is a scan's value too."""
+    ext = next(
+        (
+            ext
+            for ext in (".rtf", ".mid", ".midi", ".pict", ".pct", ".pic", ".xul")
+            if mimetypes.guess_type("f" + ext)[0] is None and mimetypes.guess_type("f" + ext, strict=False)[0]
+        ),
+        None,
+    )
+    if ext is None:
+        pytest.skip("no extension here is guessed only in non-strict mode")
+    real = temp_dir / "real"
+    _populate(real, ("f" + ext,))
+    folders.use(output=real, models=None)
+    older = _row(session, _alias(real, temp_dir / "alias") / ("f" + ext), age_days=0)
+    newer = _row(session, real / ("f" + ext), age_days=1)
+    history, scanned = _record_of(session, older.content_id), _record_of(session, newer.content_id)
+    history.job_id = "job-old"
+    scanned.mime_type = mimetypes.guess_type("f" + ext, strict=False)[0]
+    session.flush()
+
+    mark_contents_missing_outside_prefixes(session, [str(real)])
+
+    assert _records_on(session, newer.content_id) == {history.id}
