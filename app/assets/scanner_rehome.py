@@ -481,9 +481,12 @@ def _record_history(
     session: Session, path_of: dict[str, str], role_of: _RoleDeriver
 ) -> dict[str, list[tuple[str, bool]]]:
     """For each content, its records as (record id, carries history). History is
-    anything a scan would not have produced at ``path_of[content]``: a job, user
-    metadata (even {}), a preview, a rename, a tag beyond the path-derived ones, or
-    any other explicit edit (updated_at moved)."""
+    what a scan would not have produced at ``path_of[content]``: a job, user metadata
+    (even {}), a preview, a rename, a tag beyond the path-derived ones, a MIME type
+    other than the scan's guess, or an edit timestamp more than a second after
+    creation. The one edit this misses is a path-derived tag removed within the
+    first second: counting a missing derived tag would flag every untouched record
+    in a model category registered since cataloguing."""
     history: dict[str, list[tuple[str, bool]]] = {content_id: [] for content_id in path_of}
     for chunk in _batches(list(path_of)):
         records = session.execute(
