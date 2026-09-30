@@ -701,7 +701,6 @@ def apply_prune_plan(session: Session, plan: PrunePlan) -> PruneResult:
             if has_history(row)
         }
         possible = [content_id for content_id, found in verdicts.items() if any(v is not False for v in found)]
-        proven = [content_id for content_id, found in verdicts.items() if any(v is True for v in found)]
         if possible and not any(has_history(row) for row in contenders):
             # Leave the path to the scan's recovery: retire the stubs at their own
             # spellings, so the history row comes back with its own id.
@@ -735,6 +734,12 @@ def apply_prune_plan(session: Session, plan: PrunePlan) -> PruneResult:
         rewrite = None if host is occupant else {"id": host.content_id, "path": new_path}
         # A mover with history of its own keeps the path; the recoverable rows' history
         # joins it, so none is left behind on a missing row at a live path.
+        # Proven against the kept row itself: another mover may carry a different digest.
+        proven = [
+            row.content_id
+            for row in parked.get(new_path, ())
+            if row.content_id in verdicts and _same_file(row, host, hashing) is True
+        ]
         revived = tuple(
             record_id for content_id in proven for record_id, carries in history.get(content_id, ()) if carries
         )

@@ -1087,3 +1087,27 @@ def test_an_integrity_error_other_than_a_path_race_is_not_swallowed(folders, ses
 
     with pytest.raises(IntegrityError):
         mark_contents_missing_outside_prefixes(session, [str(real)])
+
+
+def test_with_hashing_on_parked_history_is_proven_against_the_kept_row_not_another_mover(
+    folders, hashing_on, session, temp_dir
+):
+    real = temp_dir / "real"
+    _populate(real, ("f.png",))
+    folders.use(output=real, models=None)
+    parked = _parked(session, real / "f.png", mtime_ns=999, hash_value="blake3:" + "1" * 64)
+    parked_record = _record_of(session, parked.content_id)
+    parked_record.job_id = "job-before-the-split"
+    kept = _row(session, _alias(real, temp_dir / "a1") / "f.png", age_days=0)
+    other = _row(session, _alias(real, temp_dir / "a2") / "f.png", age_days=1)
+    session.get(AssetContent, kept.content_id).hash = "blake3:" + "2" * 64
+    session.get(AssetContent, other.content_id).hash = "blake3:" + "1" * 64  # matches the parked row
+    _record_of(session, kept.content_id).job_id = "job-kept"
+    _record_of(session, other.content_id).job_id = "job-other"
+    session.flush()
+
+    mark_contents_missing_outside_prefixes(session, [str(real)])
+
+    assert _live(session, kept.content_id) == str(real / "f.png")
+    assert parked_record.id not in _records_on(session, kept.content_id)
+    assert "missing" in fetch_record_tags(session, parked_record.id)
