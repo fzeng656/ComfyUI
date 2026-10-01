@@ -87,9 +87,6 @@ class RespelledRow(NamedTuple):
 class Move(NamedTuple):
     row: PruneRow
     candidates: tuple[str, ...]  # the same file under owned folders, deepest first
-    # With no candidate in the row's own role: leave the row as it is (it passes the
-    # text match) rather than retire it.
-    keep_if_unfit: bool = False
 
 
 class PrunePlan(NamedTuple):
@@ -367,7 +364,7 @@ def plan_prune(
         same = [verdicts[(row.path[:len(prefix)], prefix)] for _, prefix in spellings]
         confirmed = tuple(new_path for (new_path, _), verdict in zip(spellings, same) if verdict is True)
         if confirmed:
-            moves.append(Move(row, confirmed, keep_if_unfit=True))
+            moves.append(Move(row, confirmed))
         elif all(verdict is False for verdict in same):
             # A case-sensitive directory: another folder that differs only in case.
             # Treat the row as unowned; a real alias can still claim it.
@@ -660,9 +657,10 @@ def apply_prune_plan(session: Session, plan: PrunePlan) -> PruneResult:
     for move in plan.moves:
         records = roles.get(move.row.content_id, ())
         target = next((path for path in move.candidates if role_of.fits(path, records)), None)
+        # With no candidate in its own role the row is retired, case-only ones too: left
+        # live under the old spelling, the case-sensitive sync would never see it and
+        # the scan would add a duplicate under the new one.
         if target is None:
-            if move.keep_if_unfit:
-                continue
             retire.append(move.row.content_id)
             still_present += 1
             continue

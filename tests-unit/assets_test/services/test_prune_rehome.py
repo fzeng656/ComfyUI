@@ -1111,3 +1111,21 @@ def test_with_hashing_on_parked_history_is_proven_against_the_kept_row_not_anoth
     assert _live(session, kept.content_id) == str(real / "f.png")
     assert parked_record.id not in _records_on(session, kept.content_id)
     assert "missing" in fetch_record_tags(session, parked_record.id)
+
+
+def test_a_case_only_row_whose_folder_now_has_another_role_is_retired(folders, folds_case, temp_dir, session):
+    """Left live under the old spelling, the case-sensitive sync would never see it and
+    the scan would add a duplicate under the new one."""
+    data = temp_dir / "data"
+    _populate(data, ("f.png",))
+    upper = _case_variant(data, temp_dir / "DATA")
+    folders.use(output=upper, models=None)
+    _boot()
+    (old_id,) = _records(session)
+
+    folders.use(output=None, models=None, input=data)  # the folder is now the input folder
+    _boot()
+
+    live = _records(session)
+    assert old_id not in live
+    assert [path for path, _ in live.values()] == [str(data / "f.png")]
